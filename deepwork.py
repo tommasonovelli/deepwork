@@ -2,9 +2,7 @@
 # deepwork: a local DNS filter that resolves only whitelisted sites while it is on.
 import json
 import os
-import re
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -12,11 +10,26 @@ import time
 from pathlib import Path
 
 WIN = os.name == "nt"
-if WIN:
-    import msvcrt
-else:
-    import termios
-    import tty
+
+USAGE = """Deep Work — focus mode for your machine.
+
+While deepwork is on, only whitelisted sites and a few hardcoded lifeline
+domains resolve; everything else gets an NXDOMAIN answer and won't load.
+
+Usage:
+  deepwork                  this help
+  deepwork on               start focus mode (repoints the system resolver)
+  deepwork off              stop focus mode and restore the resolver
+  deepwork add <url>        allow a site (github.com, https://x.example/path, ...)
+  deepwork remove <url>     take a site off the whitelist
+  deepwork list             show the whitelist; lifeline domains are marked (locked)
+  deepwork status           "on" or "off" plus the number of allowed sites
+
+on and off need root (Linux) or administrator (Windows) rights and re-run
+themselves with sudo/UAC when needed. Everything lives in ~/.config/deepwork
+(Linux) or %APPDATA%\\deepwork (Windows): config.json is the whitelist you can
+edit by hand, state.json tracks the running filter, blocked.log lists blocked
+hostnames and daemon.log holds the filter's output."""
 
 
 def _cfgdir():
@@ -25,15 +38,13 @@ def _cfgdir():
         return d
     if WIN:
         return os.path.join(os.environ.get("APPDATA") or str(Path.home()), "deepwork")
-    x = os.environ.get("XDG_CONFIG_HOME")
-    if x:
-        return os.path.join(x, "deepwork")
-    u = os.environ.get("SUDO_USER")
     home = str(Path.home())
-    if u:
+    u = os.environ.get("SUDO_USER")
+    if u:  # re-run under sudo: keep the original user's config
         import pwd
         home = pwd.getpwnam(u).pw_dir
-    return os.path.join(home, ".config", "deepwork")
+    x = os.environ.get("XDG_CONFIG_HOME")
+    return os.path.join(x or os.path.join(home, ".config"), "deepwork")
 
 
 DIR = _cfgdir()
@@ -71,12 +82,10 @@ def save(cfg):
 
 
 def norm(s):
+    # lowercase, drop scheme, query, fragment, path, port and a leading www.
     s = s.lower().strip().split("://", 1)[-1]
-    for c in "/?#":
-        s = s.split(c, 1)[0]
-    s = s.split(":", 1)[0].rstrip(".")
-    if s.startswith("www."):
-        s = s[4:]
+    s = s.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
+    s = s.split(":", 1)[0].rstrip(".").removeprefix("www.")
     return s if "." in s and " " not in s else ""
 
 
@@ -84,9 +93,9 @@ def add_site(url):
     s = norm(url)
     cfg = load()
     if not s:
-        return "!not a valid site"
+        return "not a valid site"
     if s in cfg["sites"] or s in ALWAYS:
-        return "!already allowed"
+        return "already allowed"
     cfg["sites"].append(s)
     save(cfg)
     return "added " + s
@@ -96,7 +105,7 @@ def remove_site(url):
     s = norm(url)
     cfg = load()
     if s not in cfg["sites"]:
-        return "!not in the list"
+        return "not in the list"
     cfg["sites"].remove(s)
     save(cfg)
     return "removed " + s
@@ -141,7 +150,7 @@ def serve(cfgpath, ups):
         t6.listen(16)
         socks += [u6, t6]
     except OSError:
-        pass
+        pass  # IPv6 is best effort
 
     cfg, mtime, logged = dict(DEFAULTS), None, set()
 
@@ -182,7 +191,7 @@ def serve(cfgpath, ups):
                 s.close()
 
     def resolve(data):
-        refresh()  # picking the config up here means an added site works on the very next query
+        refresh()  # config picked up here means an added site works on the next query
         host, off = qname(data)
         if allowed(host, cfg["sites"]):
             return forward(data, ups or cfg["upstream"]) or synth(data, off, 2)  # no upstream: SERVFAIL
@@ -260,10 +269,12 @@ def _links():
         return ls if isinstance(ls, list) else [ls]
     ls = []
     for line in _run(["ip", "-o", "route", "show", "default"]).stdout.splitlines():
-        parts = line.split()
-        for i, t in enumerate(parts[:-1]):
-            if t == "dev" and parts[i + 1] not in ls:
-                ls.append(parts[i + 1])
+        try:
+            dev = line.split(" dev ", 1)[1].split()[0]
+        except IndexError:
+            continue
+        if dev not in ls:
+            ls.append(dev)
     return ls
 
 
@@ -321,10 +332,9 @@ def state():
 
 
 def probe():
-    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"  # id + RD flag, QD=1
-    for part in ALWAYS[0].split("."):
-        q += bytes([len(part)]) + part.encode()
-    q += b"\x00\x00\x01\x00\x01"  # root label, qtype A, qclass IN
+    q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"  # id + RD flag, QD=1
+         + b"".join(bytes([len(p)]) + p.encode() for p in ALWAYS[0].split("."))
+         + b"\x00\x00\x01\x00\x01")  # root label, qtype A, qclass IN
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(1)
     try:
@@ -438,219 +448,6 @@ def status():
     return ("on" if state() else "off") + f" · {n} sites"
 
 
-# --- TUI ---
-RESET = "\x1b[0m"
-COL = {"t": "\x1b[38;2;238;246;255m", "m": "\x1b[38;2;155;179;209m",
-       "a": "\x1b[1;38;2;88;169;255m", "b": "\x1b[38;2;53;109;166m",
-       "w": "\x1b[38;2;139;200;255m", "s": "\x1b[38;2;54;139;214m",
-       "r": "\x1b[38;2;255;107;107m"}  # text, muted, accent, border, wind, sea, alert
-COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-if not COLOR:
-    COL = {k: "" for k in COL}
-    RESET = ""
-
-
-def paint(lines):
-    w = shutil.get_terminal_size().columns
-    sys.stdout.write("\x1b[2J\x1b[H")
-    for line in lines:
-        pad = max(0, (w - len(re.sub(r"\x1b\[[0-9;]*m", "", line))) // 2)
-        sys.stdout.write(" " * pad + line + RESET + "\n")
-    sys.stdout.flush()
-
-
-def key():
-    if WIN:
-        c = msvcrt.getwch()
-        if c in "\xe0\x00":
-            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")
-        return {"\r": "enter", "\n": "enter", "\x1b": "esc", "\x08": "back",
-                "\x03": "esc"}.get(c, c)
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        b = os.read(fd, 1)
-        if not b:
-            return "esc"  # stdin closed
-        if b == b"\x1b":
-            r, _, _ = select.select([fd], [], [], 0.1)  # arrows arrive as ESC [ A (or ESC O A)
-            if r and os.read(fd, 1) in (b"[", b"O"):
-                c = os.read(fd, 1)
-                return "up" if c == b"A" else "down" if c == b"B" else ""
-            return "esc"
-        n = 1 + (b[0] >= 0xC0) + (b[0] >= 0xE0) + (b[0] >= 0xF0)  # finish a UTF-8 char
-        while len(b) < n:
-            b += os.read(fd, 1)
-        c = b.decode(errors="replace")
-        return {"\r": "enter", "\n": "enter", "\x7f": "back", "\x08": "back",
-                "\x03": "esc"}.get(c, c)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def chrome(tagline):
-    return [COL["w"] + "·╌╌╍━━╍╌·", COL["a"] + "▰  Deep Work  ▰", tagline]
-
-
-def tagline():
-    on = state() is not None
-    c = COL["a"] if on else COL["m"]
-    return c + ("on" if on else "off") + RESET + COL["m"] + \
-        f" · {len(load()['sites'])} sites · dns filter"
-
-
-def box(rows, marker_at=-1):
-    h, v = ("─", "│") if COLOR else ("-", "|")
-    c = ("╭", "╮", "╰", "╯") if COLOR else ("+",) * 4
-    mk = "▸ " if COLOR else "> "
-    out = [COL["b"] + c[0] + h * 50 + c[1]]
-    for i, row in enumerate(rows):
-        m = COL["a"] + mk if i == marker_at else "  "
-        vis = len(re.sub(r"\x1b\[[0-9;]*m", "", row))
-        out.append(COL["b"] + v + " " + m + row + " " * max(0, 46 - vis) + " " + COL["b"] + v)
-    out.append(COL["b"] + c[2] + h * 50 + c[3])
-    return out
-
-
-def frame(box_lines, result="", keybar=None):
-    lines = chrome(tagline()) + box_lines
-    if result:
-        colour = COL["r"] if result.startswith("!") else COL["m"]
-        lines.append(colour + result.removeprefix("!") + RESET)
-    lines.append(COL["m"] + (keybar or "↑↓ move · enter select · q quit") + RESET)
-    lines.append(COL["s"] + "▁▂▃▄▅▆▇▆▅▄▃▂▁" + RESET)
-    return lines
-
-
-def enter_alt():
-    sys.stdout.write("\x1b[?1049h\x1b[?25l")
-    sys.stdout.flush()
-
-
-def leave_alt():
-    sys.stdout.write("\x1b[?1049l\x1b[?25h")
-    sys.stdout.flush()
-
-
-def toggle(on):
-    leave_alt()
-    subprocess.run([sys.executable, os.path.abspath(__file__), "off" if on else "on"])
-    print(COL["m"] + "press any key to continue" + RESET, end="", flush=True)
-    key()
-    enter_alt()
-    return ""
-
-
-def recent_blocked():
-    try:
-        with open(LOG, encoding="utf-8") as f:
-            hs = f.read().splitlines()
-    except OSError:
-        return []
-    out = []
-    for h in reversed(hs):  # most recent first, distinct, at most 8
-        if h and h not in out:
-            out.append(h)
-            if len(out) == 8:
-                break
-    return out
-
-
-def home():
-    sel = 0
-    result = ""
-    while True:
-        on = state() is not None
-        rows = [(("Turn off", "stop focus mode") if on else ("Turn on", "start focus mode")),
-                ("Add site", "allow one more"),
-                ("Remove site", f"{len(load()['sites'])} in the list"),
-                ("Quit", "")]
-        paint(frame(box([COL["t"] + a.ljust(16) + COL["m"] + b for a, b in rows], sel), result))
-        k = key()
-        if k in ("q", "esc"):
-            return
-        if k == "up":
-            sel = (sel - 1) % 4
-        elif k == "down":
-            sel = (sel + 1) % 4
-        elif k == "enter":
-            if sel == 0:
-                result = toggle(on)
-            elif sel == 1:
-                result = add_screen()
-            elif sel == 2:
-                result = remove_screen()
-            else:
-                return
-
-
-def add_screen():
-    inp = ""
-    result = ""
-    while True:
-        sugs = recent_blocked()
-        rows = [COL["m"] + "site to allow", COL["t"] + (inp or "type a domain")]
-        if sugs:
-            rows += [""] + [COL["m"] + f"{i+1} {h[:40]}" for i, h in enumerate(sugs)]
-        paint(frame(box(rows, 1), result, "type · enter add · esc cancel"))
-        k = key()
-        if k == "esc":
-            return result
-        if k == "back":
-            inp = inp[:-1]
-        elif k == "enter":
-            s = norm(inp)
-            cfg = load()
-            if not s:
-                result = "!not a valid site"
-            elif s in cfg["sites"] or s in ALWAYS:
-                result = "!already allowed"
-            else:
-                cfg["sites"].append(s)
-                save(cfg)
-                result = "added " + s
-                inp = ""
-        elif not inp and k in "12345678" and int(k) <= len(sugs):
-            inp = sugs[int(k) - 1]
-        elif len(k) == 1 and k.isprintable() and len(inp) < 40:
-            inp += k
-
-
-def remove_screen():
-    sel = 0
-    result = ""
-    while True:
-        sites = [s for s in load()["sites"] if s not in ALWAYS]
-        if not sites:
-            paint(frame(box([COL["m"] + "nothing to remove".center(46)], -1), result, "esc back"))
-            if key() == "esc":
-                return result
-            continue
-        sel = min(sel, len(sites) - 1)
-        paint(frame(box([COL["t"] + s[:44] for s in sites], sel), result,
-                    "↑↓ move · enter remove · esc back"))
-        k = key()
-        if k == "esc":
-            return result
-        if k == "up":
-            sel = (sel - 1) % len(sites)
-        elif k == "down":
-            sel = (sel + 1) % len(sites)
-        elif k == "enter":
-            result = remove_site(sites[sel])
-
-
-def tui():
-    try:
-        enter_alt()
-        home()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        leave_alt()
-
-
 def elevate():
     # re-run as root (Linux) or administrator (Windows): on/off touch the system resolver
     if WIN:
@@ -668,23 +465,25 @@ def elevate():
 def main():
     a = sys.argv[1:]
     if not a:
-        return tui()
-    if a[0] in ("on", "off"):
-        if elevate():
-            return None
-        return on() if a[0] == "on" else off()
-    if a[0] == "_daemon" and len(a) > 1:
-        return serve(a[1], a[2:])
-    if a[0] == "add" and len(a) > 1:
-        return add_site(a[1]).removeprefix("!")
-    if a[0] == "remove" and len(a) > 1:
-        return remove_site(a[1]).removeprefix("!")
-    if a[0] == "list":
+        return USAGE
+    cmd, *rest = a
+    if cmd == "_daemon" and len(rest) > 1:
+        return serve(rest[0], rest[1:])
+    if cmd in ("on", "off") and elevate():
+        return None
+    if cmd == "on":
+        return on()
+    if cmd == "off":
+        return off()
+    if cmd == "add" and rest:
+        return add_site(rest[0])
+    if cmd == "remove" and rest:
+        return remove_site(rest[0])
+    if cmd == "list":
         return "\n".join(load()["sites"] + [x + " (locked)" for x in ALWAYS])
-    if a[0] == "status":
+    if cmd == "status":
         return status()
-    print("usage: deepwork [on|off|add <site>|remove <site>|list|status]")
-    print("       deepwork                 the interactive menu")
+    print(USAGE)
     sys.exit(2)
 
 

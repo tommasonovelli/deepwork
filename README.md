@@ -22,11 +22,11 @@ the Windows autostart key, and leaves your config directory in place.
 `deepwork on` and `deepwork off` re-run themselves with root (Linux, via sudo) or
 administrator (Windows, via UAC) privileges. That is not an accident: turning focus mode
 on means repointing the system resolver, and only a privileged process may change that.
-Everything else — the menu, add, remove, list, status — runs unprivileged.
+Everything else — add, remove, list, status — runs unprivileged.
 
 ## Use
 
-    deepwork                the interactive menu (turn on/off, add, remove)
+    deepwork                this help (every command explained)
     deepwork on             start focus mode
     deepwork off            stop focus mode
     deepwork add <url>      allow a site (github.com, https://x.example/path, ...)
@@ -85,7 +85,7 @@ saved ones.
   were repointed, and the captured upstream. Deleted on `off`, and deleted
   automatically when `status` finds the pid dead.
 - `blocked.log` — one blocked hostname per line, most recent last, truncated at 32 KB.
-  The add screen reads it to offer recent blocked domains as suggestions.
+  Useful for spotting which domains a half-loaded page still needed.
 - `daemon.log` — the filter's stdout/stderr. If the filter dies at startup, `on`
   prints the last line of this file as the reason.
 
@@ -99,26 +99,23 @@ saved ones.
 | Filter | `serve`, `qname`, `refresh`, `synth`, `forward`, `resolve` | DNS server on 127.0.0.1:53, UDP + TCP |
 | Resolver | `upstream`, `_links`, `dns_switch`, `dns_restore` | capture and repoint the system DNS |
 | State | `alive`, `state`, `probe`, `_autostart`, `_start_daemon`, `wait_up` | pid liveness, startup probe, Windows autostart |
-| Commands | `on`, `off`, `status` | the elevated entry points |
-| TUI | `chrome`, `box`, `frame`, `key`, `home`, `add_screen`, `remove_screen` | the ANSI menu |
-| Dispatch | `elevate`, `main` | privilege re-exec, argument routing |
+| Commands | `on`, `off`, `status`, `add_site`, `remove_site` | the user-facing commands |
+| Dispatch | `elevate`, `main`, `USAGE` | privilege re-exec, argument routing, help |
 
 ## The lifeline
 
 `ALWAYS` — `anthropic.com`, `claude.ai`, `claude.com`, `claudeusercontent.com`,
 `deepseek.com`, `pi.dev` — is hardcoded and always allowed. These are not in
-`config.json`; `add` refuses them, the remove screen never lists them, and `list` marks
-them `(locked)`. The reason: this machine drives Claude Code and pi, and OAuth tokens
-are refreshed on `platform.claude.com` (a subdomain of `claude.com`), so blocking those
-domains would drop the session at the next token renewal and cut the tools that maintain
-the tool.
+`config.json`; `add` refuses them and `list` marks them `(locked)`. The reason: this
+machine drives Claude Code and pi, and OAuth tokens are refreshed on
+`platform.claude.com` (a subdomain of `claude.com`), so blocking those domains would
+drop the session at the next token renewal and cut the tools that maintain the tool.
 
 ## Honest limits
 
 - A whitelisted site can still look half-broken until you also allow the CDN domains it
-  pulls from (fonts, images, API subdomains). That is exactly what the numbered
-  suggestions on the add screen are for: when a page half-loads, `blocked.log` already
-  has the hostnames it needed, and pressing 1–8 adds them.
+  pulls from (fonts, images, API subdomains). When a page half-loads, check
+  `blocked.log` for the hostnames it needed and add them with `deepwork add`.
 - DNS filtering is not a firewall. A program that connects to a raw IP address, or that
   ships its own DNS-over-HTTPS resolver, is not stopped.
 - On Windows the setting survives a reboot by design: turning on adds a Run key that
