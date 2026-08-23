@@ -40,10 +40,14 @@ Everything else — add, remove, list, status — runs unprivileged.
 or whatever DNS servers Windows has on its interfaces. `on()` first captures what the
 machine is using right now (`upstream()`: the `nameserver` lines of
 `/run/systemd/resolve/resolv.conf` on Linux, the servers of the active interface indexes
-on Windows), then starts the filter, then moves the resolver to 127.0.0.1:53
+on Windows — loopback addresses are skipped, so the filter never ends up forwarding to
+itself), then starts the filter, then moves the resolver to 127.0.0.1:53
 (`dns_switch()`: `resolvectl dns <link> 127.0.0.1` plus `resolvectl domain <link> "~."`
-on Linux, `Set-DnsClientServerAddress` per interface on Windows). `off()` puts the saved
-links back with `dns_restore()` (`resolvectl revert` / `ResetServerAddresses`).
+on Linux, `Set-DnsClientServerAddress` per interface on Windows). If the capture comes up
+empty — the link's DNS was wiped, or already points here — the filter starts with the
+`config.json` upstream list instead. `off()` puts the saved links back with
+`dns_restore()`; on Linux that is not a plain `resolvectl revert` but the verified
+multi-step restore described under "The ordering of `on()`".
 
 **The filter.** `serve()` binds UDP and TCP on 127.0.0.1:53 (and on ::1, best effort)
 and drives both sockets with `select`. The select loop never resolves anything itself:
@@ -100,10 +104,12 @@ broken `off` is never silent, and never leaves the machine mute.
   `norm()` reduces it on read. Defaults: github.com, stackoverflow.com, python.org,
   wikipedia.org.
 - `state.json` — written when focus mode turns on: the filter's pid, the links that
-  were repointed, the captured upstream, and each of those links' own DNS servers and
-  domains, which is what `off` needs to put things back. Deleted on `off`. If the
-  filter dies while focus mode is on, the file is kept: `off` still uses the record to
-  undo the resolver switch, and `status` correctly reports the machine as off.
+  were repointed, the captured upstream and — on Linux — each of those links' own DNS
+  servers and domains, which is what `off` needs to put things back (on Windows the
+  interfaces are handed back to their defaults via `ResetServerAddresses` instead).
+  Deleted on `off`. If the filter dies while focus mode is on, the file is kept: `off`
+  still uses the record to undo the resolver switch, and `status` correctly reports the
+  machine as off.
 - `blocked.log` — one blocked hostname per line, most recent last, truncated at 32 KB.
   Useful for spotting which domains a half-loaded page still needed.
 - `daemon.log` — the filter's stdout/stderr. If the filter dies at startup, `on`
