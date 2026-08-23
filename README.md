@@ -18,7 +18,12 @@ Updating is the same command again: `git pull`, then run the installer once more
 deletes the previous installation first and copies fresh, so stale files never survive,
 and your config is never touched. Uninstall is `python3 installer.py uninstall`: it
 turns deepwork off first if it is on, removes the installed files, the PATH entry and
-the Windows autostart key, and leaves your config directory in place.
+the Windows autostart key, and leaves your config directory in place. `python3
+uninstaller.py` is the complete removal: it turns deepwork off first if it is on,
+deletes the installed files, the `deepwork` command (and on Windows the PATH entry and
+the autostart Run key) and the config directory — nothing is left behind, so it is the
+one to run when you want the config gone too. Both are safe to run when deepwork is
+not installed: they just report that there is nothing to do.
 `deepwork on` and `deepwork off` re-run themselves with root (Linux, via sudo) or
 administrator (Windows, via UAC) privileges. That is not an accident: turning focus mode
 on means repointing the system resolver, and only a privileged process may change that.
