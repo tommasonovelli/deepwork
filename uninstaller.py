@@ -66,14 +66,20 @@ def main(yes=False):
     #    is safe and never leaves DNS behind. When deepwork was never installed
     #    through installer.py, the sibling copy next to this uninstaller still
     #    knows how to turn it off.
-    script = installed if installed.exists() else Path(deepwork.__file__)
-    r = subprocess.run([sys.executable, str(script), "off"], capture_output=True, text=True)
-    if r.returncode:
-        # deleting the config directory now would destroy state.json, the only
-        # record of what to restore: abort while the user can still recover
-        sys.exit("deepwork uninstaller: off failed: " + (r.stderr.strip() or r.stdout.strip()
-                or "no error output") + "\nrun: sudo deepwork off first")
-    print(r.stdout.strip() or "turned deepwork off")
+    #    repointed() rather than state(), which goes None once the pid is dead —
+    #    exactly when the resolver is still aimed at a filter that is gone. It is
+    #    also False on a machine that was never on, so an ordinary removal does
+    #    not demand root just to ask.
+    if deepwork.repointed():
+        script = installed if installed.exists() else Path(deepwork.__file__)
+        # no capture: the off subprocess may re-exec through sudo, whose password
+        # prompt must reach the terminal; off prints its own result, so nothing is
+        # lost by not reading it back
+        if subprocess.run([sys.executable, str(script), "off"]).returncode:
+            # deleting the config directory now would destroy state.json, the only
+            # record of what to restore: abort while the user can still recover
+            sys.exit("deepwork uninstaller: off failed; nothing was removed\n"
+                     "run: sudo deepwork off first")
     # 2. Drop the command: the shim on Linux, the PATH entry and the autostart
     #    Run key on Windows.
     if WIN:

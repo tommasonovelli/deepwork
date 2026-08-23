@@ -69,9 +69,21 @@ def install():
 def uninstall():
     elevate()
     dst = Path(prefix()) / ("deepwork" if WIN else os.path.join("lib", "deepwork"))
-    if deepwork.state():  # never leave the resolver pointing at a deleted filter
-        subprocess.run([sys.executable, str(dst / "deepwork.py"), "off"])
-        print("turned deepwork off")
+    # Undo the resolver switch before the filter's file disappears. repointed()
+    # rather than state(): state() goes None once the pid is dead, and a dead
+    # filter with the resolver still aimed at it is the case that matters most.
+    # It also stays False on a machine that was never on, so an ordinary
+    # uninstall does not demand root just to ask.
+    if deepwork.repointed():
+        script = dst / "deepwork.py"
+        if not script.exists():
+            script = Path(deepwork.__file__)
+        # no capture: the off subprocess may re-exec through sudo, whose password
+        # prompt must reach the terminal; off prints its own result either way
+        if subprocess.run([sys.executable, str(script), "off"]).returncode:
+            # removing deepwork.py now would take away the command that fixes DNS
+            sys.exit("deepwork installer: off failed; nothing was removed\n"
+                     "run: sudo deepwork off first")
     if WIN:
         edit_path(str(dst), False)
         deepwork._autostart(False)

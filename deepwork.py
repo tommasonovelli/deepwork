@@ -19,12 +19,13 @@ domains resolve; everything else gets an NXDOMAIN answer and won't load.
 
 Usage:
   deepwork                  this help
+  deepwork --help           print this help and exit (also -h, help)
   deepwork on               start focus mode (repoints the system resolver)
   deepwork off              stop focus mode and restore the resolver
-  deepwork add <url>        allow a site (github.com, https://x.example/path, ...)
-  deepwork remove <url>     take a site off the whitelist
+  deepwork add <url>        allow sites (github.com, https://x.example/path, ...)
+  deepwork remove <url>     take sites off the whitelist
   deepwork list             show the whitelist; lifeline domains are marked (locked)
-  deepwork status           "on" or "off" plus the number of allowed sites
+  deepwork status           "on" or "off", the site count, and any warning
 
 on and off need root (Linux) or administrator (Windows) rights and re-run
 themselves with sudo/UAC when needed. Everything lives in ~/.config/deepwork
@@ -556,6 +557,17 @@ def state():
         # its links and their saved configuration are exactly what 'off' needs.
         return None
     return st
+
+
+def repointed():
+    # Whether anything still needs undoing, for the installers deciding whether to
+    # run 'off' at all. state() is the wrong question: it goes None the moment the
+    # pid dies, which is exactly when the resolver is still pointed at a filter
+    # that is gone. Asking this instead keeps an uninstall from demanding root on
+    # a machine where focus mode was never on.
+    if os.path.exists(STATE):
+        return True
+    return any(_loopback_dns(l) for l in _links())
 
 
 def probe():
