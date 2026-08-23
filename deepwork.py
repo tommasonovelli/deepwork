@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 WIN = os.name == "nt"
@@ -69,8 +70,13 @@ def own(path):
 def load():
     try:
         with open(CFG, encoding="utf-8") as f:
-            return {**DEFAULTS, **json.load(f)}
-    except (OSError, ValueError):
+            cfg = {**DEFAULTS, **json.load(f)}
+        # entries typed by hand go through the same normalisation as 'deepwork
+        # add', so a URL pasted straight into config.json works instead of
+        # sitting there matching nothing
+        cfg["sites"] = [s for s in map(norm, cfg["sites"]) if s]
+        return cfg
+    except (OSError, ValueError, TypeError, AttributeError):
         return dict(DEFAULTS)
 
 
@@ -82,10 +88,10 @@ def save(cfg):
 
 
 def norm(s):
-    # lowercase, drop scheme, query, fragment, path, port and a leading www.
+    # lowercase, drop scheme, query, fragment, path, port, a leading *. and www.
     s = s.lower().strip().split("://", 1)[-1]
     s = s.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
-    s = s.split(":", 1)[0].rstrip(".").removeprefix("www.")
+    s = s.split(":", 1)[0].rstrip(".").removeprefix("*.").removeprefix("www.")
     return s if "." in s and " " not in s else ""
 
 
@@ -160,9 +166,10 @@ def serve(cfgpath, ups):
             m = os.stat(cfgpath).st_mtime
             if m != mtime:
                 with open(cfgpath, encoding="utf-8") as f:
-                    cfg = {**DEFAULTS, **json.load(f)}
-                mtime = m
-        except (OSError, ValueError):
+                    c = {**DEFAULTS, **json.load(f)}
+                c["sites"] = [s for s in map(norm, c["sites"]) if s]
+                cfg, mtime = c, m  # swapped in together: a worker never sees a half-load
+        except (OSError, ValueError, TypeError, AttributeError):
             pass
 
     def synth(pkt, off, rcode):
@@ -190,42 +197,63 @@ def serve(cfgpath, ups):
             finally:
                 s.close()
 
-    def resolve(data):
-        refresh()  # config picked up here means an added site works on the next query
+    def resolve(data, sites, upl):
         host, off = qname(data)
-        if allowed(host, cfg["sites"]):
-            return forward(data, ups or cfg["upstream"]) or synth(data, off, 2)  # no upstream: SERVFAIL
+        if allowed(host, sites):
+            return forward(data, ups or upl) or synth(data, off, 2)  # no upstream: SERVFAIL
         log_blocked(host)
         return synth(data, off, 3)  # NXDOMAIN
+
+    def answer_udp(sock, data, addr, sites, upl):
+        try:
+            sock.sendto(resolve(data, sites, upl), addr)
+        except Exception:
+            pass  # one bad packet must never kill a worker
+
+    def answer_tcp(conn, sites, upl):
+        try:
+            with conn:
+                conn.settimeout(10)
+                hdr = conn.recv(2)  # TCP framing: 2-byte big-endian length prefix
+                if len(hdr) != 2:
+                    return
+                n = int.from_bytes(hdr, "big")
+                q = b""
+                while len(q) < n:
+                    chunk = conn.recv(n - len(q))
+                    if not chunk:
+                        break
+                    q += chunk
+                if q:
+                    reply = resolve(q, sites, upl)
+                    conn.sendall(len(reply).to_bytes(2, "big") + reply)
+        except Exception:
+            pass  # a client that stalls must never hold up anyone else
 
     try:
         if os.path.getsize(LOG) > 32 * 1024:
             os.truncate(LOG, 0)
     except OSError:
         pass
+    own(LOG)  # keep the log readable by the user, like the rest of the config dir
 
+    # The loop must never block. forward() waits up to 2s per upstream, and doing
+    # that inline stalls every other query behind it, blocked ones included: one
+    # unresponsive upstream turned the whole filter into a queue. So the loop only
+    # reads and hands off. refresh() stays here, where it is still single-threaded,
+    # and the workers run on the snapshot it produced — no lock, no shared state.
+    pool = ThreadPoolExecutor(max_workers=64)
     while True:
         for s in select.select(socks, [], [])[0]:
             try:
+                refresh()  # config picked up here means an added site works on the next query
+                sites, upl = cfg["sites"], cfg["upstream"]
                 if s.type == socket.SOCK_STREAM:
                     conn, _ = s.accept()
-                    with conn:
-                        conn.settimeout(10)
-                        hdr = conn.recv(2)  # TCP framing: 2-byte big-endian length prefix
-                        if len(hdr) == 2:
-                            n = int.from_bytes(hdr, "big")
-                            q = b""
-                            while len(q) < n:
-                                chunk = conn.recv(n - len(q))
-                                if not chunk:
-                                    break
-                                q += chunk
-                            if q:
-                                reply = resolve(q)
-                                conn.sendall(len(reply).to_bytes(2, "big") + reply)
+                    pool.submit(answer_tcp, conn, sites, upl)
                 else:
                     data, addr = s.recvfrom(4096)
-                    s.sendto(resolve(data), addr)
+                    pool.submit(answer_udp, s, data, addr, sites, upl)
             except Exception:
                 pass  # one bad packet must never kill the daemon
 
@@ -254,13 +282,15 @@ def upstream():
         ups = _pswin("").get("upstream") or []
         if not isinstance(ups, list):
             ups = [ups]
-        return [x for x in ups if x and x != "127.0.0.1"]
+        return [x for x in ups if x and not x.startswith("127.")]
     try:
         with open("/run/systemd/resolve/resolv.conf", encoding="utf-8") as f:
             ns = [l.split()[1] for l in f if l.startswith("nameserver ")]
     except OSError:
         return []
-    return [n for n in ns if n != "127.0.0.1"]
+    # any loopback address would point the filter back at itself, directly or
+    # through the resolved stub: never capture one as an upstream
+    return [x for x in ns if not x.startswith("127.") and x != "::1"]
 
 
 def _links():
@@ -278,6 +308,41 @@ def _links():
     return ls
 
 
+def _all_links():
+    # every interface, so 'off' also finds a repointed link that is no longer a
+    # default route, or that a stale state file no longer mentions
+    try:
+        return sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return []
+
+
+def _link_config(link):
+    # What the link hands out right now. 'resolvectl dns eno1' answers
+    # "Link 2 (eno1): 1.2.3.4 5.6.7.8" and prints nothing after the colon when
+    # the link has none, so everything past the first colon is the value.
+    def value(cmd):
+        out = _run(["resolvectl", cmd, link]).stdout
+        return out.split(":", 1)[-1].split() if ":" in out else []
+    return {"dns": value("dns"), "domain": value("domain")}
+
+
+def _has_dns(link):
+    # a link with no DNS server at all resolves nothing: that is the state 'off'
+    # must never leave behind
+    return bool(_link_config(link)["dns"])
+
+
+def _loopback_dns(link):
+    # True when the link still hands out the deepwork loopback resolver
+    if WIN:
+        out = _run(PS + [f"(Get-DnsClientServerAddress -InterfaceIndex {link} "
+                         "-AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                         "Select-Object -ExpandProperty ServerAddresses) -join ' '"]).stdout.lower()
+        return any(t in ("127.0.0.1", "::1") for t in out.split())
+    return any(t in ("127.0.0.1", "::1") for t in _link_config(link)["dns"])
+
+
 def dns_switch():
     if WIN:
         j = _pswin("foreach($i in $l){Set-DnsClientServerAddress -InterfaceIndex $i "
@@ -293,15 +358,44 @@ def dns_switch():
     return ls
 
 
-def dns_restore(links):
+def dns_restore(links, saved=None):
+    # Only links whose DNS still points at the deepwork loopback are touched, so
+    # a hand-configured DNS server on an unrelated interface is never clobbered.
+    # Every failure is verified and reported instead of being swallowed.
+    saved = saved or {}
+    bad = []
     if WIN:
         for i in links:
+            if not _loopback_dns(i):
+                continue
             _run(PS + [f"Set-DnsClientServerAddress -InterfaceIndex {i} -ResetServerAddresses"])
+            if _loopback_dns(i):
+                bad.append(str(i))
         _run(["ipconfig", "/flushdns"])
-        return
+        return bad
+    routed = _links()  # the links that actually carry traffic: those must end with DNS
     for link in links:
-        _run(["resolvectl", "revert", link])
+        if not _loopback_dns(link):
+            continue
+        if _run(["resolvectl", "revert", link]).returncode:
+            _run(["resolvectl", "revert", link])  # one retry before giving up
+        # revert is not a restore. It drops the link's whole runtime configuration,
+        # including the servers NetworkManager pushed over D-Bus, and NM does not
+        # push them again until the device is reactivated — so a plain revert used
+        # to leave the machine with no resolver at all until the next reboot. Ask
+        # NM to reapply, and if that does not bring DNS back, write down what the
+        # link had before the switch.
+        if not _has_dns(link):
+            _run(["nmcli", "device", "reapply", link])
+        was = saved.get(link) or {}
+        if not _has_dns(link) and was.get("dns"):
+            _run(["resolvectl", "dns", link] + was["dns"])
+            if was.get("domain"):
+                _run(["resolvectl", "domain", link] + was["domain"])
+        if _loopback_dns(link) or (link in routed and not _has_dns(link)):
+            bad.append(link)
     _run(["resolvectl", "flush-caches"])
+    return bad
 
 
 def alive(pid):
@@ -323,10 +417,8 @@ def state():
     except (OSError, ValueError):
         return None
     if not st.get("pid") or not alive(st["pid"]):
-        try:
-            os.unlink(STATE)
-        except OSError:
-            pass
+        # keep the file. If the filter died while the resolver was still repointed,
+        # its links and their saved configuration are exactly what 'off' needs.
         return None
     return st
 
@@ -400,7 +492,9 @@ def wait_up(daemon):
 def on():
     if state():
         return "already on"
-    ups = upstream()
+    # An empty capture — the link's DNS was wiped, or already points here — must
+    # not start the filter with nothing to forward to: fall back to config.json.
+    ups = upstream() or load()["upstream"]
     daemon = _start_daemon(ups)
     if not wait_up(daemon):
         if daemon.poll() is None:
@@ -411,13 +505,21 @@ def on():
         except (OSError, IndexError):
             reason = "see " + os.path.join(DIR, "daemon.log")
         return "filter failed to start: " + reason
-    links = dns_switch()
+    links = _links()
     if not links:
         daemon.terminate()
         return "could not repoint the system resolver, nothing was changed"
+    # Record before switching: an interruption between these two moments must
+    # still leave 'off' with the record it needs to undo the switch. That record
+    # includes each link's own DNS configuration, because reverting the switch
+    # does not bring it back on its own — see dns_restore.
+    saved = {} if WIN else {l: _link_config(l) for l in links}
     with open(STATE, "w", encoding="utf-8") as f:
-        json.dump({"pid": daemon.pid, "links": links, "upstream": ups}, f)
+        json.dump({"pid": daemon.pid, "links": links, "upstream": ups, "saved": saved}, f)
     own(STATE)
+    if not dns_switch():
+        off()
+        return "could not repoint the system resolver, nothing was changed"
     try:
         socket.getaddrinfo(ALWAYS[0], 443)  # safety gate: the machine must still resolve
     except OSError:
@@ -428,9 +530,23 @@ def on():
 
 
 def off():
-    st = state()
-    dns_restore((st or {}).get("links") or _links())
-    if st:
+    # Read the state file directly, even when its daemon is dead: the recorded
+    # links are the ground truth of what was repointed. The current default
+    # routes and every interface are swept too, so a repointed link that state
+    # lost track of (crash between switch and write, renamed interface, ...) is
+    # still found. dns_restore only touches links with loopback DNS, so clean
+    # interfaces and hand-configured DNS servers are left alone.
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = None
+    links = list((st or {}).get("links") or [])
+    for l in _links() + _all_links():
+        if l not in links:
+            links.append(l)
+    bad = dns_restore(links, (st or {}).get("saved"))
+    if st and st.get("pid"):
         try:
             os.kill(st["pid"], 15)
         except OSError:
@@ -440,6 +556,9 @@ def off():
     except OSError:
         pass
     _autostart(False)
+    if bad:
+        return ("off, but the DNS of " + ", ".join(bad) + " could not be restored"
+                + "; fix with: sudo nmcli device reapply " + bad[0])
     return "off"
 
 
@@ -467,7 +586,7 @@ def main():
     if not a:
         return USAGE
     cmd, *rest = a
-    if cmd == "_daemon" and len(rest) > 1:
+    if cmd == "_daemon" and rest:  # the upstream list may be empty: config.json has one
         return serve(rest[0], rest[1:])
     if cmd in ("on", "off") and elevate():
         return None

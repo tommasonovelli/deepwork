@@ -46,9 +46,13 @@ on Linux, `Set-DnsClientServerAddress` per interface on Windows). `off()` puts t
 links back with `dns_restore()` (`resolvectl revert` / `ResetServerAddresses`).
 
 **The filter.** `serve()` binds UDP and TCP on 127.0.0.1:53 (and on ::1, best effort)
-and drives both sockets with `select`. For each query it parses the hostname straight
-off the wire (`qname()`: the DNS labels starting at byte 12), applies the policy, and
-either forwards or blocks. Allowed queries are sent byte-for-byte unchanged to the first
+and drives both sockets with `select`. The select loop never resolves anything itself:
+it reads a query and hands it to a thread pool, because forwarding waits up to 2s for an
+upstream and doing that inline put every other query — blocked ones included — in a queue
+behind it. A worker parses the hostname straight off the wire (`qname()`: the DNS labels starting at byte 12), applies the policy, and
+either forwards or blocks. `refresh()` runs in the loop, where it is still
+single-threaded, and each worker gets the config snapshot it produced, so there is no
+lock anywhere. Allowed queries are sent byte-for-byte unchanged to the first
 upstream that answers (`forward()`; 2s timeout, each captured upstream tried in order,
 with the `config.json` upstream list as fallback) and the reply is relayed verbatim.
 Blocked queries get an NXDOMAIN that `synth()` builds by hand from the question — it
@@ -59,31 +63,47 @@ verbatim.
 dot at all, when it ends in a local suffix (`.lan`, `.local`, `.home.arpa`,
 `.internal`, `.in-addr.arpa`, `.ip6.arpa`), or when it equals — or is a subdomain of —
 anything in the whitelist plus the ALWAYS lifeline. So allowing `github.com` also allows
-`api.github.com`, while `raw.githubusercontent.com` needs its own entry. `add` and
-`remove` normalise their argument (`norm()`: lowercase, strip scheme, path, port and a
-leading `www.`) before touching the list.
+`api.github.com`, while `raw.githubusercontent.com` needs its own entry. Every entry goes through `norm()` —
+lowercase, strip scheme, query, fragment, path, port and a leading `*.` or `www.` — both
+when `add` and `remove` touch the list and when `load`/`refresh` read it, so a URL pasted
+straight into `config.json` by hand works instead of sitting there matching nothing.
+Entries that cannot be a hostname are dropped on read.
 
 **Live config.** The filter stats `config.json` on every query and reloads it when the
-mtime changes (`refresh()`), so `deepwork add` takes effect on the very next query of a
-filter that is already running.
+mtime changes (`refresh()`), so `deepwork add` — or your editor — takes effect on the
+very next query of a filter that is already running.
 
 **The ordering of `on()` is deliberate.** Capture the upstream first, start the filter,
 prove it answers by sending it a probe query for an ALWAYS domain (`probe()` polled by
-`wait_up()`), and only then move the resolver. As a last safety gate, after the switch
-`on()` resolves one ALWAYS domain through the *system* resolver; if that raises, it
-calls `off()` — revert DNS, kill the filter, drop state — and reports the failure. A
-machine is never left without working DNS by `on`. Conversely `off()` rescues a broken
-setup even when state is missing: it reverts the current default links if it has no
-saved ones.
+`wait_up()`), and only then move the resolver. `state.json` is written *before* the
+resolver is moved, so even a kill between the two leaves `off` the record it needs. As
+a last safety gate, after the switch `on()` resolves one ALWAYS domain through the
+*system* resolver; if that raises, it calls `off()` — revert DNS, kill the filter, drop
+state — and reports the failure. A machine is never left without working DNS by `on`.
+`off()` is just as defensive: it reads the recorded links straight from `state.json`
+even when the filter's pid is dead, sweeps the current default routes and every
+interface for any link whose DNS still points at the deepwork loopback resolver, and
+restores those. Restoring is not just `resolvectl revert`: revert drops the link's whole
+runtime configuration, including the servers NetworkManager pushed over D-Bus, and NM
+does not push them again until the device is reactivated — a plain revert left the
+machine with no resolver at all until the next reboot. So `off()` reverts, then checks
+that the link has a DNS server again, then asks NetworkManager to reapply, then falls
+back to writing down what `on()` saved for that link. If a link that carries a default
+route still ends up without DNS, `off` says so and names the command that fixes it — a
+broken `off` is never silent, and never leaves the machine mute.
 
 **The data directory.** Everything lives in `~/.config/deepwork` (Linux) or
 `%APPDATA%\deepwork` (Windows):
 
 - `config.json` — `{"sites": [...], "upstream": [...]}`, the only file you edit by
-  hand. Defaults: github.com, stackoverflow.com, python.org, wikipedia.org.
+  hand, and it is meant to be edited by hand: write whatever form of URL you like,
+  `norm()` reduces it on read. Defaults: github.com, stackoverflow.com, python.org,
+  wikipedia.org.
 - `state.json` — written when focus mode turns on: the filter's pid, the links that
-  were repointed, and the captured upstream. Deleted on `off`, and deleted
-  automatically when `status` finds the pid dead.
+  were repointed, the captured upstream, and each of those links' own DNS servers and
+  domains, which is what `off` needs to put things back. Deleted on `off`. If the
+  filter dies while focus mode is on, the file is kept: `off` still uses the record to
+  undo the resolver switch, and `status` correctly reports the machine as off.
 - `blocked.log` — one blocked hostname per line, most recent last, truncated at 32 KB.
   Useful for spotting which domains a half-loaded page still needed.
 - `daemon.log` — the filter's stdout/stderr. If the filter dies at startup, `on`
@@ -96,8 +116,8 @@ saved ones.
 | Paths & constants | `_cfgdir`, `ALWAYS`, `LOCAL`, `DEFAULTS` | where data lives, the lifeline, local suffixes |
 | Config | `load`, `save`, `norm` | read/write `config.json`, normalise user input |
 | Policy | `allowed` | the whole allow/block decision |
-| Filter | `serve`, `qname`, `refresh`, `synth`, `forward`, `resolve` | DNS server on 127.0.0.1:53, UDP + TCP |
-| Resolver | `upstream`, `_links`, `dns_switch`, `dns_restore` | capture and repoint the system DNS |
+| Filter | `serve`, `qname`, `refresh`, `synth`, `forward`, `resolve`, `answer_udp`, `answer_tcp` | DNS server on 127.0.0.1:53, UDP + TCP, one worker per query |
+| Resolver | `upstream`, `_links`, `_all_links`, `_link_config`, `_has_dns`, `_loopback_dns`, `dns_switch`, `dns_restore` | capture, repoint and restore the system DNS |
 | State | `alive`, `state`, `probe`, `_autostart`, `_start_daemon`, `wait_up` | pid liveness, startup probe, Windows autostart |
 | Commands | `on`, `off`, `status`, `add_site`, `remove_site` | the user-facing commands |
 | Dispatch | `elevate`, `main`, `USAGE` | privilege re-exec, argument routing, help |
@@ -122,5 +142,7 @@ drop the session at the next token renewal and cut the tools that maintain the t
   restarts the filter at login, so a rebooted machine is still in focus mode.
   `deepwork off` is always the way out. On Linux a reboot clears everything, because
   systemd-resolved settings are runtime-only.
-- `deepwork off` reverts the default links even when deepwork was never on. That is the
-  rescue path, and it also clears a DNS server you had set by hand on that link.
+- `deepwork off` only touches links whose DNS is still pointed at the deepwork
+  loopback resolver (127.0.0.1/::1): a DNS server you had set by hand on another
+  interface is never clobbered. If a link that carries a default route cannot be
+  given its DNS back, `off` says so instead of silently pretending everything is fine.
