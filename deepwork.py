@@ -88,6 +88,12 @@ def _clean(cfg):
     # a loopback upstream would make the filter query itself: the same rule the
     # live upstream() capture applies, so a hand-edited config cannot self-query
     cfg["upstream"] = [x for x in cfg["upstream"] if not x.startswith("127.") and x != "::1"]
+    # entries typed by hand go through the same normalisation as 'deepwork add',
+    # so a URL pasted straight into config.json works instead of sitting there
+    # matching nothing; dict.fromkeys drops repeats and keeps the order. This
+    # lives here, not in the callers, so the CLI and the running filter can
+    # never end up with two different readings of the same file.
+    cfg["sites"] = list(dict.fromkeys(s for s in map(norm, cfg["sites"]) if s))
     return cfg
 
 
@@ -98,12 +104,7 @@ def load():
     try:
         with open(CFG, encoding="utf-8") as f:
             cfg = {**DEFAULTS, **json.load(f)}
-        cfg = _clean(cfg)
-        # entries typed by hand go through the same normalisation as 'deepwork
-        # add', so a URL pasted straight into config.json works instead of
-        # sitting there matching nothing
-        cfg["sites"] = list(dict.fromkeys(s for s in map(norm, cfg["sites"]) if s))
-        return cfg
+        return _clean(cfg)
     except FileNotFoundError:
         return dict(DEFAULTS)
     except OSError as e:
@@ -125,6 +126,10 @@ def save(cfg):
     tmp = CFG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    try:  # the rename brings the temp file's mode with it: keep the old one
+        os.chmod(tmp, os.stat(CFG).st_mode & 0o777)
+    except OSError:
+        pass  # first write, nothing to inherit from
     os.replace(tmp, CFG)
     own(CFG)
 
@@ -141,9 +146,9 @@ def add_site(url):
     s = norm(url)
     cfg = load()
     if not s:
-        return "not a valid site"
+        return url + " is not a valid site"
     if s in cfg["sites"] or s in ALWAYS:
-        return "already allowed"
+        return s + " is already allowed"
     cfg["sites"].append(s)
     save(cfg)
     return "added " + s
@@ -153,9 +158,9 @@ def remove_site(url):
     s = norm(url)
     cfg = load()
     if s in ALWAYS:
-        return "is a lifeline domain and is always allowed"
+        return s + " is a lifeline domain and is always allowed"
     if s not in cfg["sites"]:
-        return "not in the list"
+        return s + " is not in the list"
     cfg["sites"].remove(s)
     save(cfg)
     return "removed " + s
@@ -220,7 +225,6 @@ def serve(cfgpath, ups):
                 with open(cfgpath, encoding="utf-8") as f:
                     c = {**DEFAULTS, **json.load(f)}
                 c = _clean(c)
-                c["sites"] = [s for s in map(norm, c["sites"]) if s]
                 cfg, mtime = c, m  # swapped in together: a worker never sees a half-load
         except (OSError, ValueError, TypeError, ConfigError):
             pass  # a bad edit keeps the last good config until it is fixed
@@ -254,13 +258,19 @@ def serve(cfgpath, ups):
         for u in ups:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                s.settimeout(2)
                 # connect() makes the kernel drop datagrams from any other
                 # source, and a reply whose transaction id does not match the
-                # query's is a forgery: read again until the timeout expires
+                # query's is a forgery: read again. One deadline bounds the
+                # whole exchange — a per-recv timeout alone would reset the
+                # 2-second window on every wrong-id datagram and pin the worker
                 s.connect((u, 53))
                 s.send(query)
+                deadline = time.monotonic() + 2
                 while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    s.settimeout(left)
                     reply = s.recv(4096)
                     if reply[:2] == query[:2]:
                         return reply
@@ -272,8 +282,15 @@ def serve(cfgpath, ups):
     def resolve(data, sites, upl):
         q = qname(data)
         if q is None:
-            # truncated or compressed names: FORMERR with an empty header beats
-            # silence, which made the client wait out its own timeout
+            # a packet without a full 12-byte header carries no transaction id,
+            # so no reply can be built for it: drop it, garbage would only
+            # confuse the client further
+            if len(data) < 12:
+                return None
+            # truncated or compressed names: FORMERR beats silence, which made
+            # the client wait out its own timeout. The reply is exactly the
+            # 12-byte header: id + flags (rcode 1) + the four zeroed counts
+            # (QDCOUNT included: the question could not be parsed)
             return data[:2] + bytes([0x81, 0x81]) + b"\x00" * 8
         host, off = q
         if allowed(host, sites):
@@ -283,7 +300,9 @@ def serve(cfgpath, ups):
 
     def answer_udp(sock, data, addr, sites, upl):
         try:
-            sock.sendto(resolve(data, sites, upl), addr)
+            reply = resolve(data, sites, upl)
+            if reply is not None:  # None: no header, nothing valid to send back
+                sock.sendto(reply, addr)
         except Exception:
             pass  # one bad packet must never kill a worker
 
@@ -308,6 +327,8 @@ def serve(cfgpath, ups):
                     if not q or len(q) < n:
                         return
                     reply = resolve(q, sites, upl)
+                    if reply is None:  # no header: no valid reply exists, keep reading
+                        continue
                     conn.sendall(len(reply).to_bytes(2, "big") + reply)
         except Exception:
             pass  # a client that stalls must never hold up anyone else
@@ -703,10 +724,16 @@ def off():
 
 
 def status():
-    n = len(load()["sites"])
+    # a broken config must not take status down with it: the warning below is
+    # the one thing worth knowing when the resolver is pointing at a dead
+    # filter, and that is exactly the moment a bad edit would hide it
+    try:
+        what = f"{len(load()['sites'])} sites"
+    except ConfigError as e:
+        what = f"config error: {e}"
     st = state()
     if st:
-        return f"on · {n} sites"
+        return f"on · {what}"
     # state() returned None because there is no state file or the daemon died:
     # the latter leaves the resolver pointing at a filter that is not running,
     # and the machine resolves nothing until 'off' runs. Use the links the state
@@ -717,9 +744,9 @@ def status():
     except (OSError, ValueError):
         links = _links()
     if links and any(_loopback_dns(l) for l in links):
-        return (f"off · {n} sites (warning: the resolver still points at deepwork but "
+        return (f"off · {what} (warning: the resolver still points at deepwork but "
                 "the filter is not running — run: sudo deepwork off)")
-    return f"off · {n} sites"
+    return f"off · {what}"
 
 
 def elevate():
@@ -743,6 +770,14 @@ def main():
     cmd, *rest = a
     if cmd == "_daemon" and rest:  # the upstream list may be empty: config.json has one
         return serve(rest[0], rest[1:])
+    if cmd in ("add", "remove", "_daemon") and not rest:
+        # a known verb with a missing argument is not an unknown command: say
+        # what is missing so the user can fix it
+        if cmd == "_daemon":
+            print("deepwork: _daemon needs a config file: deepwork _daemon <config> [upstream ...]")
+        else:
+            print(f"deepwork: {cmd} needs a site: deepwork {cmd} <url>")
+        sys.exit(2)
     if cmd in ("on", "off") and elevate():
         return None
     if cmd == "on":
@@ -750,6 +785,7 @@ def main():
     if cmd == "off":
         return off()
     if cmd == "add" and rest:
+        # several sites print one per line, so every message names its subject
         return "\n".join(add_site(x) for x in rest)
     if cmd == "remove" and rest:
         return "\n".join(remove_site(x) for x in rest)
