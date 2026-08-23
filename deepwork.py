@@ -52,7 +52,13 @@ DIR = _cfgdir()
 CFG = os.path.join(DIR, "config.json")
 STATE = os.path.join(DIR, "state.json")
 LOG = os.path.join(DIR, "blocked.log")
-PORT = int(os.environ.get("DEEPWORK_PORT") or 53)
+try:
+    PORT = int(os.environ.get("DEEPWORK_PORT") or 53)
+    if not 1 <= PORT <= 65535:
+        raise ValueError
+except ValueError:
+    print("deepwork: ignoring DEEPWORK_PORT, using 53", file=sys.stderr)
+    PORT = 53
 ALWAYS = ("anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com",
           "deepseek.com", "pi.dev")
 LOCAL = (".lan", ".local", ".home.arpa", ".internal", ".in-addr.arpa", ".ip6.arpa")
@@ -67,23 +73,59 @@ def own(path):
         os.chown(path, pw.pw_uid, pw.pw_gid)
 
 
+class ConfigError(Exception):
+    pass
+
+
+def _clean(cfg):
+    # sites and upstream are hand-edited: reject the whole file rather than
+    # half-apply it, because a string where a list belongs silently empties the
+    # whitelist
+    for k in ("sites", "upstream"):
+        v = cfg.get(k)
+        if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
+            raise ConfigError(f'"{k}" must be a list of strings')
+    # a loopback upstream would make the filter query itself: the same rule the
+    # live upstream() capture applies, so a hand-edited config cannot self-query
+    cfg["upstream"] = [x for x in cfg["upstream"] if not x.startswith("127.") and x != "::1"]
+    return cfg
+
+
 def load():
+    # a missing file is a legitimate first run, but a present file that will not
+    # parse is a hand-edit mistake: surfacing it beats silently writing the
+    # defaults over the user's list on the next add
     try:
         with open(CFG, encoding="utf-8") as f:
             cfg = {**DEFAULTS, **json.load(f)}
+        cfg = _clean(cfg)
         # entries typed by hand go through the same normalisation as 'deepwork
         # add', so a URL pasted straight into config.json works instead of
         # sitting there matching nothing
-        cfg["sites"] = [s for s in map(norm, cfg["sites"]) if s]
+        cfg["sites"] = list(dict.fromkeys(s for s in map(norm, cfg["sites"]) if s))
         return cfg
-    except (OSError, ValueError, TypeError, AttributeError):
+    except FileNotFoundError:
         return dict(DEFAULTS)
+    except OSError as e:
+        raise ConfigError(f"cannot read {os.path.basename(CFG)}: {e.strerror}") from None
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{os.path.basename(CFG)} is not valid JSON (line {e.lineno} "
+                          f"column {e.colno}); fix it or delete it to start over") from None
+    except ValueError:
+        raise ConfigError(f"{os.path.basename(CFG)} is not valid JSON; "
+                          f"fix it or delete it to start over") from None
+    except TypeError:
+        raise ConfigError(f"{os.path.basename(CFG)} must contain a JSON object") from None
 
 
 def save(cfg):
     os.makedirs(DIR, exist_ok=True)
-    with open(CFG, "w", encoding="utf-8") as f:
+    # write to a temp file and rename so a crash mid-write cannot leave a
+    # half-written config.json behind
+    tmp = CFG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    os.replace(tmp, CFG)
     own(CFG)
 
 
@@ -110,6 +152,8 @@ def add_site(url):
 def remove_site(url):
     s = norm(url)
     cfg = load()
+    if s in ALWAYS:
+        return "is a lifeline domain and is always allowed"
     if s not in cfg["sites"]:
         return "not in the list"
     cfg["sites"].remove(s)
@@ -129,13 +173,21 @@ def allowed(name, sites):
 
 def qname(pkt):
     # DNS labels: length byte + bytes per label, 0-terminated, starting at byte 12.
+    # Never index past the end, and a compression pointer (top two bits set) is
+    # malformed in a query: both used to raise IndexError and drop the packet.
     parts = []
     i = 12
-    while pkt[i]:
+    while i < len(pkt) and pkt[i]:
         n = pkt[i]
+        if n >= 0xC0:
+            return None
         i += 1
+        if i + n > len(pkt):
+            return None
         parts.append(pkt[i:i + n].decode("latin-1"))
         i += n
+    if i >= len(pkt) or i + 5 > len(pkt):
+        return None
     return ".".join(parts), i + 5  # past the 0 terminator and the 4 qtype/qclass bytes
 
 
@@ -158,7 +210,7 @@ def serve(cfgpath, ups):
     except OSError:
         pass  # IPv6 is best effort
 
-    cfg, mtime, logged = dict(DEFAULTS), None, set()
+    cfg, mtime, logged, log_writes = dict(DEFAULTS), None, set(), 0
 
     def refresh():
         nonlocal cfg, mtime
@@ -167,38 +219,63 @@ def serve(cfgpath, ups):
             if m != mtime:
                 with open(cfgpath, encoding="utf-8") as f:
                     c = {**DEFAULTS, **json.load(f)}
+                c = _clean(c)
                 c["sites"] = [s for s in map(norm, c["sites"]) if s]
                 cfg, mtime = c, m  # swapped in together: a worker never sees a half-load
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
+        except (OSError, ValueError, TypeError, ConfigError):
+            pass  # a bad edit keeps the last good config until it is fixed
 
     def synth(pkt, off, rcode):
-        # response flags + RCODE, zeroed counts, question echoed; drops any EDNS OPT
-        return pkt[:2] + bytes([0x81, 0x80 | rcode]) + pkt[4:6] + b"\x00" * 6 + pkt[12:off]
+        # response flags + RCODE, QDCOUNT fixed at 1, zeroed counts, question
+        # echoed; drops any EDNS OPT. The echo is capped so a long name cannot
+        # grow the reply past the 512 bytes some resolvers refuse.
+        return pkt[:2] + bytes([0x81, 0x80 | rcode]) + b"\x00\x01" + b"\x00" * 6 + pkt[12:min(off, 512)]
 
     def log_blocked(host):
+        nonlocal log_writes
         if host not in logged:
             logged.add(host)
+            log_writes += 1
             try:
+                # a stat on every write is not free either: re-check the size
+                # every 64 writes so the log cannot grow without bound
+                if log_writes % 64 == 0 and os.path.getsize(LOG) > 32 * 1024:
+                    os.truncate(LOG, 0)
                 with open(LOG, "a", encoding="utf-8") as f:
                     f.write(host + "\n")
             except OSError:
                 pass
+            # an ad-heavy session is thousands of unique names: bound the set
+            # too, or the daemon keeps them all in memory forever
+            if len(logged) > 5000:
+                logged.clear()
 
     def forward(query, ups):
         for u in ups:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
                 s.settimeout(2)
-                s.sendto(query, (u, 53))
-                return s.recvfrom(4096)[0]
+                # connect() makes the kernel drop datagrams from any other
+                # source, and a reply whose transaction id does not match the
+                # query's is a forgery: read again until the timeout expires
+                s.connect((u, 53))
+                s.send(query)
+                while True:
+                    reply = s.recv(4096)
+                    if reply[:2] == query[:2]:
+                        return reply
             except OSError:
                 pass
             finally:
                 s.close()
 
     def resolve(data, sites, upl):
-        host, off = qname(data)
+        q = qname(data)
+        if q is None:
+            # truncated or compressed names: FORMERR with an empty header beats
+            # silence, which made the client wait out its own timeout
+            return data[:2] + bytes([0x81, 0x81]) + b"\x00" * 8
+        host, off = q
         if allowed(host, sites):
             return forward(data, ups or upl) or synth(data, off, 2)  # no upstream: SERVFAIL
         log_blocked(host)
@@ -213,18 +290,23 @@ def serve(cfgpath, ups):
     def answer_tcp(conn, sites, upl):
         try:
             with conn:
-                conn.settimeout(10)
-                hdr = conn.recv(2)  # TCP framing: 2-byte big-endian length prefix
-                if len(hdr) != 2:
-                    return
-                n = int.from_bytes(hdr, "big")
-                q = b""
-                while len(q) < n:
-                    chunk = conn.recv(n - len(q))
-                    if not chunk:
-                        break
-                    q += chunk
-                if q:
+                conn.settimeout(2)
+                # RFC 7766: a client may pipeline several queries over one
+                # connection, so keep reading length-prefixed queries until it
+                # closes or the idle timeout expires
+                while True:
+                    hdr = conn.recv(2)  # TCP framing: 2-byte big-endian length prefix
+                    if len(hdr) != 2:
+                        return
+                    n = int.from_bytes(hdr, "big")
+                    q = b""
+                    while len(q) < n:
+                        chunk = conn.recv(n - len(q))
+                        if not chunk:
+                            break
+                        q += chunk
+                    if not q or len(q) < n:
+                        return
                     reply = resolve(q, sites, upl)
                     conn.sendall(len(reply).to_bytes(2, "big") + reply)
         except Exception:
@@ -243,6 +325,10 @@ def serve(cfgpath, ups):
     # reads and hands off. refresh() stays here, where it is still single-threaded,
     # and the workers run on the snapshot it produced — no lock, no shared state.
     pool = ThreadPoolExecutor(max_workers=64)
+    # TCP gets its own small pool: a stalled TCP client pins a worker for the
+    # whole timeout, and enough of them would starve UDP, which is the path that
+    # matters — TCP is only the rare fallback.
+    tcp_pool = ThreadPoolExecutor(max_workers=8)
     while True:
         for s in select.select(socks, [], [])[0]:
             try:
@@ -250,7 +336,7 @@ def serve(cfgpath, ups):
                 sites, upl = cfg["sites"], cfg["upstream"]
                 if s.type == socket.SOCK_STREAM:
                     conn, _ = s.accept()
-                    pool.submit(answer_tcp, conn, sites, upl)
+                    tcp_pool.submit(answer_tcp, conn, sites, upl)
                 else:
                     data, addr = s.recvfrom(4096)
                     pool.submit(answer_udp, s, data, addr, sites, upl)
@@ -259,7 +345,10 @@ def serve(cfgpath, ups):
 
 
 def _run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:  # a helper that is not installed must not abort a restore
+        return subprocess.CompletedProcess(cmd, 127, "", "")
 
 
 PS = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
@@ -323,7 +412,9 @@ def _link_config(link):
     # the link has none, so everything past the first colon is the value.
     def value(cmd):
         out = _run(["resolvectl", cmd, link]).stdout
-        return out.split(":", 1)[-1].split() if ":" in out else []
+        # an alias interface like eth0:1 has a colon inside the name, so split
+        # after the closing parenthesis, not on the first colon
+        return out.partition("):")[2].split() if "):" in out else []
     return {"dns": value("dns"), "domain": value("domain")}
 
 
@@ -358,6 +449,11 @@ def dns_switch():
     return ls
 
 
+def _needs_repair(link):
+    # still pointing at the filter, or left with nothing at all: both are broken
+    return _loopback_dns(link) or not _has_dns(link)
+
+
 def dns_restore(links, saved=None):
     # Only links whose DNS still points at the deepwork loopback are touched, so
     # a hand-configured DNS server on an unrelated interface is never clobbered.
@@ -385,10 +481,10 @@ def dns_restore(links, saved=None):
         # to leave the machine with no resolver at all until the next reboot. Ask
         # NM to reapply, and if that does not bring DNS back, write down what the
         # link had before the switch.
-        if not _has_dns(link):
+        if _needs_repair(link):
             _run(["nmcli", "device", "reapply", link])
         was = saved.get(link) or {}
-        if not _has_dns(link) and was.get("dns"):
+        if _needs_repair(link) and was.get("dns"):
             _run(["resolvectl", "dns", link] + was["dns"])
             if was.get("domain"):
                 _run(["resolvectl", "domain", link] + was["domain"])
@@ -408,6 +504,20 @@ def alive(pid):
         return False
     except OSError:
         return True  # e.g. PermissionError: the process exists, we just cannot signal it
+
+
+def is_daemon(pid):
+    # a state file can outlive a reboot and its pid be reused, so never signal a
+    # process that is not this filter
+    if WIN:
+        out = _run(["tasklist", "/FI", f"PID eq {pid}"]).stdout
+        return str(pid) in out and "python" in out.lower()
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().split(b"\x00")
+    except OSError:
+        return False
+    return any(b"deepwork" in a for a in args) and any(a == b"_daemon" for a in args)
 
 
 def state():
@@ -490,43 +600,65 @@ def wait_up(daemon):
 
 
 def on():
-    if state():
-        return "already on"
-    # An empty capture — the link's DNS was wiped, or already points here — must
-    # not start the filter with nothing to forward to: fall back to config.json.
-    ups = upstream() or load()["upstream"]
-    daemon = _start_daemon(ups)
-    if not wait_up(daemon):
-        if daemon.poll() is None:
-            daemon.terminate()
-        try:
-            with open(os.path.join(DIR, "daemon.log"), encoding="utf-8") as f:
-                reason = f.read().strip().splitlines()[-1]
-        except (OSError, IndexError):
-            reason = "see " + os.path.join(DIR, "daemon.log")
-        return "filter failed to start: " + reason
-    links = _links()
-    if not links:
-        daemon.terminate()
-        return "could not repoint the system resolver, nothing was changed"
-    # Record before switching: an interruption between these two moments must
-    # still leave 'off' with the record it needs to undo the switch. That record
-    # includes each link's own DNS configuration, because reverting the switch
-    # does not bring it back on its own — see dns_restore.
-    saved = {} if WIN else {l: _link_config(l) for l in links}
-    with open(STATE, "w", encoding="utf-8") as f:
-        json.dump({"pid": daemon.pid, "links": links, "upstream": ups, "saved": saved}, f)
-    own(STATE)
-    if not dns_switch():
-        off()
-        return "could not repoint the system resolver, nothing was changed"
+    os.makedirs(DIR, exist_ok=True)
+    # a second concurrent 'on' would overwrite the first's state.json, so the
+    # lock file is claimed exclusively up front and released on every exit path;
+    # a dead holder is a crashed run whose lock can be claimed
+    lock = os.path.join(DIR, "state.lock")
     try:
-        socket.getaddrinfo(ALWAYS[0], 443)  # safety gate: the machine must still resolve
-    except OSError:
-        off()
-        return "DNS broke after the switch; everything reverted"
-    _autostart(True)
-    return "on"
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            with open(lock) as f:
+                holder = int(f.read())
+        except (OSError, ValueError):
+            holder = 0
+        if holder and alive(holder):
+            return "already on"
+        os.unlink(lock)
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode())
+    try:
+        if state():
+            return "already on"
+        # An empty capture — the link's DNS was wiped, or already points here — must
+        # not start the filter with nothing to forward to: fall back to config.json.
+        ups = upstream() or load()["upstream"]
+        daemon = _start_daemon(ups)
+        if not wait_up(daemon):
+            if daemon.poll() is None:
+                daemon.terminate()
+            try:
+                with open(os.path.join(DIR, "daemon.log"), encoding="utf-8") as f:
+                    reason = f.read().strip().splitlines()[-1]
+            except (OSError, IndexError):
+                reason = "see " + os.path.join(DIR, "daemon.log")
+            return "filter failed to start: " + reason
+        links = _links()
+        if not links:
+            daemon.terminate()
+            return "could not repoint the system resolver, nothing was changed"
+        # Record before switching: an interruption between these two moments must
+        # still leave 'off' with the record it needs to undo the switch. That record
+        # includes each link's own DNS configuration, because reverting the switch
+        # does not bring it back on its own — see dns_restore.
+        saved = {} if WIN else {l: _link_config(l) for l in links}
+        with open(STATE, "w", encoding="utf-8") as f:
+            json.dump({"pid": daemon.pid, "links": links, "upstream": ups, "saved": saved}, f)
+        own(STATE)
+        if not dns_switch():
+            off()
+            return "could not repoint the system resolver, nothing was changed"
+        try:
+            socket.getaddrinfo(ALWAYS[0], 443)  # safety gate: the machine must still resolve
+        except OSError:
+            off()
+            return "DNS broke after the switch; everything reverted"
+        _autostart(True)
+        return "on"
+    finally:
+        os.close(fd)
+        os.unlink(lock)
 
 
 def off():
@@ -546,9 +678,17 @@ def off():
         if l not in links:
             links.append(l)
     bad = dns_restore(links, (st or {}).get("saved"))
-    if st and st.get("pid"):
+    if st and st.get("pid") and is_daemon(st["pid"]):
         try:
             os.kill(st["pid"], 15)
+            # off must not return while the port is still bound: a quick
+            # `off && on` would otherwise fail with EADDRINUSE
+            for _ in range(40):
+                if not alive(st["pid"]):
+                    break
+                time.sleep(0.05)
+            if alive(st["pid"]):
+                os.kill(st["pid"], 9)
         except OSError:
             pass
     try:
@@ -564,7 +704,22 @@ def off():
 
 def status():
     n = len(load()["sites"])
-    return ("on" if state() else "off") + f" · {n} sites"
+    st = state()
+    if st:
+        return f"on · {n} sites"
+    # state() returned None because there is no state file or the daemon died:
+    # the latter leaves the resolver pointing at a filter that is not running,
+    # and the machine resolves nothing until 'off' runs. Use the links the state
+    # file recorded first; only sweep the default routes when there is none.
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            links = (json.load(f) or {}).get("links") or []
+    except (OSError, ValueError):
+        links = _links()
+    if links and any(_loopback_dns(l) for l in links):
+        return (f"off · {n} sites (warning: the resolver still points at deepwork but "
+                "the filter is not running — run: sudo deepwork off)")
+    return f"off · {n} sites"
 
 
 def elevate():
@@ -595,13 +750,16 @@ def main():
     if cmd == "off":
         return off()
     if cmd == "add" and rest:
-        return add_site(rest[0])
+        return "\n".join(add_site(x) for x in rest)
     if cmd == "remove" and rest:
-        return remove_site(rest[0])
+        return "\n".join(remove_site(x) for x in rest)
     if cmd == "list":
         return "\n".join(load()["sites"] + [x + " (locked)" for x in ALWAYS])
     if cmd == "status":
         return status()
+    if cmd in ("--help", "-h", "help"):
+        return USAGE
+    print("deepwork: unknown command: " + cmd)
     print(USAGE)
     sys.exit(2)
 

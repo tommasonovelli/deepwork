@@ -22,12 +22,12 @@ def elevate():
     if WIN:
         return
     b = Path(prefix()) / "bin"
-    try:
-        b.mkdir(parents=True, exist_ok=True)
-        p = b / (".probe" + str(os.getpid()))
-        p.write_text("x")
-        p.unlink()
-    except PermissionError:
+    # probe the nearest existing parent: creating a probe file here would create
+    # the very directory the probe is meant to test
+    probe = b
+    while not probe.exists():
+        probe = probe.parent
+    if not os.access(probe, os.W_OK):
         # sudo strips most env vars; re-export the ones that decide where we install
         env = [f"{v}={os.environ[v]}" for v in ("DEEPWORK_PREFIX", "DEEPWORK_DIR") if v in os.environ]
         os.execvp("sudo", ["sudo", *env, sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
@@ -60,6 +60,7 @@ def install():
         print(f"installed {dst / 'deepwork.py'} and added {dst} to the user PATH")
     else:
         shim = Path(prefix()) / "bin" / "deepwork"
+        shim.parent.mkdir(parents=True, exist_ok=True)
         shim.write_text(f'#!/bin/sh\nexec python3 {dst / "deepwork.py"} "$@"\n')
         shim.chmod(0o755)
         print(f"installed {dst / 'deepwork.py'} with command shim at {shim}")
