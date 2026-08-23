@@ -136,11 +136,20 @@ broken `off` is never silent, and never leaves the machine mute.
 ## The lifeline
 
 `ALWAYS` — `anthropic.com`, `claude.ai`, `claude.com`, `claudeusercontent.com`,
-`deepseek.com`, `pi.dev` — is hardcoded and always allowed. These are not in
-`config.json`; `add` refuses them and `list` marks them `(locked)`. The reason: this
-machine drives Claude Code and pi, and OAuth tokens are refreshed on
-`platform.claude.com` (a subdomain of `claude.com`), so blocking those domains would
-drop the session at the next token renewal and cut the tools that maintain the tool.
+`deepseek.com`, `pi.dev`, `connectivity-check.ubuntu.com` — is hardcoded and always
+allowed. These are not in `config.json`; `add` refuses them and `list` marks them
+`(locked)`. The reason for the first six: this machine drives Claude Code and pi, and
+OAuth tokens are refreshed on `platform.claude.com` (a subdomain of `claude.com`), so
+blocking those domains would drop the session at the next token renewal and cut the
+tools that maintain the tool.
+
+`connectivity-check.ubuntu.com` is there for a different reason. It is the URI
+NetworkManager fetches to decide whether the machine is online (`NetworkManager
+--print-config`, `[connectivity] uri`). With it blocked, `nmcli networking
+connectivity` reports `limited`, the desktop puts a warning on the network icon, and
+applications that check for a captive portal start behaving as if one were in the way —
+which looks exactly like the connection breaking, even though every whitelisted site
+still resolves.
 
 ## Honest limits
 

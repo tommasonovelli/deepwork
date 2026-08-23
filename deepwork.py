@@ -60,7 +60,11 @@ except ValueError:
     print("deepwork: ignoring DEEPWORK_PORT, using 53", file=sys.stderr)
     PORT = 53
 ALWAYS = ("anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com",
-          "deepseek.com", "pi.dev")
+          "deepseek.com", "pi.dev",
+          # NetworkManager's connectivity probe. Blocking it makes the desktop
+          # decide the machine is offline: a warning on the network icon and
+          # apps that behave as if they were behind a captive portal.
+          "connectivity-check.ubuntu.com")
 LOCAL = (".lan", ".local", ".home.arpa", ".internal", ".in-addr.arpa", ".ip6.arpa")
 DEFAULTS = {"sites": ["github.com", "stackoverflow.com", "python.org", "wikipedia.org"],
             "upstream": ["1.1.1.1", "8.8.8.8"]}
