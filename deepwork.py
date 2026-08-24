@@ -22,7 +22,7 @@ Usage:
   deepwork --help           print this help and exit (also -h, help)
   deepwork on               start focus mode (repoints the system resolver)
   deepwork off              stop focus mode and restore the resolver
-  deepwork add <url>        allow sites (github.com, https://x.example/path, ...)
+  deepwork add <url>        allow sites, and the domains they load assets from
   deepwork remove <url>     take sites off the whitelist
   deepwork list             show the whitelist; lifeline domains are marked (locked)
   deepwork status           "on" or "off", the site count, and any warning
@@ -147,6 +147,41 @@ def norm(s):
     return s if "." in s and " " not in s else ""
 
 
+def companions(site, sites):
+    # A site's own domain is rarely the whole site: github.com serves none of its
+    # stylesheets or scripts, wikipedia.org none of its images, and a page whose
+    # assets are blocked renders as broken as one that never loaded at all. Read
+    # them off the page itself — but only from tags that *load* something. A
+    # footer's <a href> to tiktok.com is a link, not an asset, and following those
+    # would quietly let back in exactly what the whitelist exists to keep out.
+    # None means the page could not be read; [] means it needed nothing else.
+    import re
+    import urllib.request
+    req = urllib.request.Request("https://" + site, headers={"User-Agent":
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            html = r.read(2 * 1024 * 1024).decode("utf-8", "replace")
+    except Exception:  # offline, TLS, 403, a redirect loop: adding must still work
+        return None
+    out = []
+    for m in re.finditer(r"<(script|img|link)\b([^>]*)>", html, re.I):
+        kind, attrs = m.group(1).lower(), m.group(2)
+        # <link> is the one tag that both loads and merely points: keep the rels
+        # that fetch something and drop the rest (canonical, alternate, author...)
+        if kind == "link" and not re.search(
+                r"rel=[\"']?\s*(stylesheet|icon|preload|prefetch|preconnect|dns-prefetch)",
+                attrs, re.I):
+            continue
+        u = re.search(r"\b(?:src|href)=[\"'](//[^\"']+|https?://[^\"']+)", attrs, re.I)
+        if not u:
+            continue  # a relative path is served by the site itself, already allowed
+        h = norm(u.group(1).split("//", 1)[1])
+        if h and not allowed(h, sites + out):
+            out.append(h)
+    return out
+
+
 def add_site(url):
     s = norm(url)
     cfg = load()
@@ -155,8 +190,20 @@ def add_site(url):
     if s in cfg["sites"] or s in ALWAYS:
         return s + " is already allowed"
     cfg["sites"].append(s)
-    save(cfg)
-    return "added " + s
+    save(cfg)  # save first: a running filter picks the site up on its next query,
+    out = ["added " + s]  # so the page below resolves instead of being blocked
+    # ...except that the resolver is still holding the NXDOMAIN it was given a
+    # moment ago for this very name. Dropping it needs no privileges.
+    _run(["ipconfig", "/flushdns"] if WIN else ["resolvectl", "flush-caches"])
+    comp = companions(s, cfg["sites"])
+    if comp is None:
+        out.append("  (could not open the site; no asset domains learned)")
+    for h in comp or []:
+        cfg["sites"].append(h)
+        out.append("  + " + h + " (asset)")
+    if comp:
+        save(cfg)
+    return "\n".join(out)
 
 
 def remove_site(url):
@@ -242,6 +289,10 @@ def serve(cfgpath, ups):
 
     def log_blocked(host):
         nonlocal log_writes
+        # a resolver may randomise the case of the name it forwards (DNS 0x20), so
+        # one domain reaches here as several distinct strings: fold it or the set
+        # below stops deduplicating and a single host fills the log with variants
+        host = host.lower()
         if host not in logged:
             logged.add(host)
             log_writes += 1
@@ -261,7 +312,10 @@ def serve(cfgpath, ups):
 
     def forward(query, ups):
         for u in ups:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # a captured upstream may be IPv6: the router hands one out over RA
+            # as often as not, and an AF_INET socket cannot reach it at all
+            s = socket.socket(socket.AF_INET6 if ":" in u else socket.AF_INET,
+                              socket.SOCK_DGRAM)
             try:
                 # connect() makes the kernel drop datagrams from any other
                 # source, and a reply whose transaction id does not match the
@@ -299,7 +353,12 @@ def serve(cfgpath, ups):
             return data[:2] + bytes([0x81, 0x81]) + b"\x00" * 8
         host, off = q
         if allowed(host, sites):
-            return forward(data, ups or upl) or synth(data, off, 2)  # no upstream: SERVFAIL
+            # captured upstreams first, then the config.json list. That list used
+            # to apply only to an *empty* capture, so a captured server that went
+            # away stranded every allowed query on a SERVFAIL with a working
+            # fallback sitting unused in the config
+            fall = ups + [u for u in upl if u not in ups]
+            return forward(data, fall) or synth(data, off, 2)  # nobody answered: SERVFAIL
         log_blocked(host)
         return synth(data, off, 3)  # NXDOMAIN
 
@@ -480,7 +539,7 @@ def _needs_repair(link):
     return _loopback_dns(link) or not _has_dns(link)
 
 
-def dns_restore(links, saved=None):
+def dns_restore(links, saved=None, fallback=None):
     # Only links whose DNS still points at the deepwork loopback are touched, so
     # a hand-configured DNS server on an unrelated interface is never clobbered.
     # Every failure is verified and reported instead of being swallowed.
@@ -514,6 +573,13 @@ def dns_restore(links, saved=None):
             _run(["resolvectl", "dns", link] + was["dns"])
             if was.get("domain"):
                 _run(["resolvectl", "domain", link] + was["domain"])
+        # Last resort for a link that carries traffic: nothing to restore from and
+        # NM did not step in, so the choice is between a working resolver and none
+        # at all. Point it at the servers the filter was forwarding to — not the
+        # machine's own configuration, but the machine resolves again, and the next
+        # NM event puts the real one back.
+        if fallback and link in routed and _needs_repair(link):
+            _run(["resolvectl", "dns", link] + list(fallback))
         if _loopback_dns(link) or (link in routed and not _has_dns(link)):
             bad.append(link)
     _run(["resolvectl", "flush-caches"])
@@ -544,6 +610,36 @@ def is_daemon(pid):
     except OSError:
         return False
     return any(b"deepwork" in a for a in args) and any(a == b"_daemon" for a in args)
+
+
+def _daemons():
+    # Every filter process serving *this* config. An 'on' interrupted between the
+    # spawn and the state file leaves one behind, and the survivor keeps the port:
+    # the next 'on' then starts a process that dies on bind while probe() is
+    # cheerfully answered by the orphan, so state.json ends up holding a pid that
+    # is already dead and no later 'off' can find the filter that is really running.
+    if WIN:
+        return []
+    out = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                args = f.read().split(b"\x00")
+        except OSError:
+            continue  # the process went away while we were looking at it
+        if b"_daemon" in args and CFG.encode() in args:
+            out.append(int(p))
+    return out
+
+
+def _reap(pids):
+    for p in pids:
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
 
 
 def state():
@@ -631,7 +727,12 @@ def wait_up(daemon):
         if daemon.poll() is not None:
             return False  # it died, usually because something already holds the port
         if probe():
-            return True
+            # Something answers on the port — but that is not proof it is ours. A
+            # process that lost the bind to another resolver dies a moment after
+            # the spawn, and the answer just seen came from whatever beat it there.
+            # Repointing the machine at that would filter nothing at all.
+            time.sleep(0.15)
+            return daemon.poll() is None
         time.sleep(0.05)
     return False
 
@@ -658,9 +759,20 @@ def on():
     try:
         if state():
             return "already on"
+        # What the last run wrote down. Reached only when no recorded filter is
+        # alive, so this file is a leftover — but a leftover holding the only
+        # trace of the machine's real resolver, for the case below where the live
+        # capture can no longer see it.
+        try:
+            with open(STATE, encoding="utf-8") as f:
+                prev = json.load(f) or {}
+        except (OSError, ValueError, TypeError):
+            prev = {}
+        _reap(_daemons())  # an orphan would keep the port and answer probe() for us
         # An empty capture — the link's DNS was wiped, or already points here — must
-        # not start the filter with nothing to forward to: fall back to config.json.
-        ups = upstream() or load()["upstream"]
+        # not start the filter with nothing to forward to: fall back to what the
+        # last run captured, then to config.json.
+        ups = upstream() or (prev.get("upstream") or []) or load()["upstream"]
         daemon = _start_daemon(ups)
         if not wait_up(daemon):
             if daemon.poll() is None:
@@ -679,7 +791,19 @@ def on():
         # still leave 'off' with the record it needs to undo the switch. That record
         # includes each link's own DNS configuration, because reverting the switch
         # does not bring it back on its own — see dns_restore.
-        saved = {} if WIN else {l: _link_config(l) for l in links}
+        saved, was = {}, prev.get("saved") or {}
+        for l in [] if WIN else links:
+            cur = _link_config(l)
+            # A link still pointing at the filter — a previous 'off' that could not
+            # restore it, a crash — must not have the loopback written down as the
+            # DNS to put back: the next 'off' would dutifully restore the machine to
+            # a filter that is not running. Keep the older record, and with none,
+            # keep nothing at all: dns_restore then falls back to revert + reapply,
+            # which is a repair, where a loopback entry would be sabotage.
+            if not any(t in ("127.0.0.1", "::1") for t in cur["dns"]):
+                saved[l] = cur
+            elif was.get(l):
+                saved[l] = was[l]
         with open(STATE, "w", encoding="utf-8") as f:
             json.dump({"pid": daemon.pid, "links": links, "upstream": ups, "saved": saved}, f)
         own(STATE)
@@ -714,7 +838,15 @@ def off():
     for l in _links() + _all_links():
         if l not in links:
             links.append(l)
-    bad = dns_restore(links, (st or {}).get("saved"))
+    # what the filter was forwarding to, for the last-resort repair in dns_restore
+    fall = list((st or {}).get("upstream") or [])
+    if not fall:
+        try:
+            fall = load()["upstream"]
+        except ConfigError:
+            fall = []
+    bad = dns_restore(links, (st or {}).get("saved"),
+                      [u for u in fall if not u.startswith("127.") and u != "::1"])
     if st and st.get("pid") and is_daemon(st["pid"]):
         try:
             os.kill(st["pid"], 15)
@@ -728,6 +860,10 @@ def off():
                 os.kill(st["pid"], 9)
         except OSError:
             pass
+    # The recorded pid is not the whole story: a filter the state file never knew
+    # about, or one it lost track of, would otherwise survive every 'off' and keep
+    # the port for good. 'off' means no filter left running.
+    _reap(_daemons())
     try:
         os.unlink(STATE)
     except OSError:
